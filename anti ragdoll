@@ -1,0 +1,199 @@
+-- Anti Knockback System
+-- https://discord.gg/s54hCcVnjJ
+
+local function setupAntiKnockback()
+    local isEnabled = false
+    local connections = {}
+    
+    local function shouldApplyAntiKnockback(humanoid)
+        local state = humanoid:GetState()
+        local knockoutStates = {
+            [Enum.HumanoidStateType.Physics] = true,
+            [Enum.HumanoidStateType.Ragdoll] = true,
+            [Enum.HumanoidStateType.FallingDown] = true,
+            [Enum.HumanoidStateType.GettingUp] = true
+        }
+        
+        return not knockoutStates[state]
+    end
+    
+    local function enableControls(player)
+        pcall(function()
+            local playerScripts = player:WaitForChild("PlayerScripts")
+            local playerModule = playerScripts:WaitForChild("PlayerModule")
+            require(playerModule):GetControls():Enable()
+        end)
+    end
+    
+    local function cleanCharacter(character, cleanBodyMovers)
+        -- Remove constraints that cause knockback
+        for _, descendant in pairs(character:GetDescendants()) do
+            if descendant:IsA("BallSocketConstraint") or 
+               descendant:IsA("NoCollisionConstraint") or 
+               descendant:IsA("HingeConstraint") or
+               (descendant:IsA("Attachment") and (descendant.Name == "A" or descendant.Name == "B")) then
+                descendant:Destroy()
+            elseif cleanBodyMovers and (descendant:IsA("BodyVelocity") or 
+                   descendant:IsA("BodyPosition") or 
+                   descendant:IsA("BodyGyro")) then
+                descendant:Destroy()
+            end
+        end
+        
+        -- Re-enable Motor6D joints
+        for _, descendant in pairs(character:GetDescendants()) do
+            if descendant:IsA("Motor6D") then
+                descendant.Enabled = true
+            end
+        end
+    end
+    
+    local function stopKnockbackAnimations(animator)
+        for _, track in pairs(animator:GetPlayingAnimationTracks()) do
+            if track.Animation then
+                local animName = track.Animation.Name:lower()
+                if animName:find("rag") or animName:find("fall") or 
+                   animName:find("hurt") or animName:find("down") or
+                   animName:find("knock") or animName:find("stun") then
+                    track:Stop(0)
+                end
+            end
+        end
+    end
+    
+    local function enableAntiKnockback()
+        if isEnabled then return end
+        
+        isEnabled = true
+        local Players = game:GetService("Players")
+        local ReplicatedStorage = game:GetService("ReplicatedStorage")
+        local Workspace = game:GetService("Workspace")
+        local RunService = game:GetService("RunService")
+        local localPlayer = Players.LocalPlayer
+        
+        -- Wait for character
+        local character = localPlayer.Character or localPlayer.CharacterAdded:Wait()
+        local humanoid = character:WaitForChild("Humanoid")
+        local humanoidRootPart = character:WaitForChild("HumanoidRootPart")
+        local camera = Workspace.CurrentCamera
+        local animator = humanoid:WaitForChild("Animator")
+        
+        -- Anti knockback settings
+        local velocityChangeThreshold = 40
+        local minVelocityMagnitude = 25
+        local maxVelocityMagnitude = 15
+        local cleanBodyMovers = true
+        local lastVelocity = Vector3.new(0, 0, 0)
+        
+        -- Handle state changes
+        table.insert(connections, humanoid.StateChanged:Connect(function(oldState, newState)
+            if shouldApplyAntiKnockback(humanoid) then
+                humanoid:ChangeState(Enum.HumanoidStateType.Running)
+                cleanCharacter(character, cleanBodyMovers)
+                stopKnockbackAnimations(animator)
+                camera.CameraSubject = humanoid
+                enableControls(localPlayer)
+            end
+        end))
+        
+        -- Intercept knockback impulses
+        pcall(function()
+            -- Try to find and connect to knockback events
+            if ReplicatedStorage:FindFirstChild("Packages") then
+                local packages = ReplicatedStorage.Packages
+                if packages:FindFirstChild("Net") then
+                    local net = packages.Net
+                    if net:FindFirstChild("RE/CombatService/ApplyImpulse") then
+                        table.insert(connections, net["RE/CombatService/ApplyImpulse"].OnClientEvent:Connect(function()
+                            if shouldApplyAntiKnockback(humanoid) then
+                                humanoidRootPart.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+                            end
+                        end))
+                    end
+                end
+            end
+        end)
+        
+        -- Handle new descendants added to character
+        table.insert(connections, character.DescendantAdded:Connect(function(descendant)
+            if shouldApplyAntiKnockback(humanoid) then
+                cleanCharacter(character, cleanBodyMovers)
+                stopKnockbackAnimations(animator)
+            end
+        end))
+        
+        -- Main anti knockback loop
+        table.insert(connections, RunService.Heartbeat:Connect(function()
+            if shouldApplyAntiKnockback(humanoid) then
+                -- Clean character
+                cleanCharacter(character, cleanBodyMovers)
+                stopKnockbackAnimations(animator)
+                
+                -- Limit velocity to prevent knockback
+                local currentVelocity = humanoidRootPart.AssemblyLinearVelocity
+                
+                -- Check if velocity change is sudden (knockback)
+                local velocityChange = (currentVelocity - lastVelocity).Magnitude
+                
+                if velocityChange > velocityChangeThreshold and currentVelocity.Magnitude > minVelocityMagnitude then
+                    -- Apply velocity limiting
+                    local limitedVelocity = currentVelocity.Unit * math.min(currentVelocity.Magnitude, maxVelocityMagnitude)
+                    humanoidRootPart.AssemblyLinearVelocity = limitedVelocity
+                end
+                
+                lastVelocity = currentVelocity
+            end
+        end))
+        
+        -- Initial setup
+        enableControls(localPlayer)
+        cleanCharacter(character, cleanBodyMovers)
+        stopKnockbackAnimations(animator)
+        
+        -- Handle character respawns
+        table.insert(connections, localPlayer.CharacterAdded:Connect(function(newCharacter)
+            character = newCharacter
+            humanoid = newCharacter:WaitForChild("Humanoid")
+            humanoidRootPart = newCharacter:WaitForChild("HumanoidRootPart")
+            animator = humanoid:WaitForChild("Animator")
+            lastVelocity = Vector3.new(0, 0, 0)
+            
+            enableControls(localPlayer)
+            cleanCharacter(newCharacter, cleanBodyMovers)
+            stopKnockbackAnimations(animator)
+        end))
+    end
+    
+    local function disableAntiKnockback()
+        if not isEnabled then return end
+        
+        isEnabled = false
+        
+        -- Disconnect all connections
+        for _, connection in pairs(connections) do
+            if connection then
+                connection:Disconnect()
+            end
+        end
+        
+        connections = {}
+    end
+    
+    return {
+        Enable = enableAntiKnockback,
+        Disable = disableAntiKnockback,
+        IsEnabled = function() return isEnabled end
+    }
+end
+
+-- Usage example:
+-- local antiKnockback = setupAntiKnockback()
+-- 
+-- -- To enable:
+-- antiKnockback.Enable()
+-- 
+-- -- To disable:
+-- antiKnockback.Disable()
+-- 
+-- -- To check if enabled:
+-- print(antiKnockback.IsEnabled())
